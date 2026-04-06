@@ -1,0 +1,29 @@
+# Build artifacts
+*.o
+*.dylib
+infer
+chat
+*.a
+
+# Model weights
+model_weights.bin
+vocab.bin
+tokenizer.bin
+expert_cache/
+packed_experts/
+*.safetensors
+*.gguf
+
+# Mac
+.DS_Store
+*.swp
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# Data
+results/
+logs/
+*.tsv
