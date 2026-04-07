@@ -1,0 +1,319 @@
+#!/usr/bin/env python3
+"""Patch infer.m with TurboQuant integration. Run on mini after cloning."""
+
+import re
+
+INFER = "metal_infer/infer.m"
+
+with open(INFER) as f:
+    src = f.read()
+
+# ---------------------------------------------------------------------------
+# CHANGE 1: Constants (after NUM_EXPERTS_PER_TOK line 80)
+# ---------------------------------------------------------------------------
+c1_old = "#define NUM_EXPERTS_PER_TOK 10\n#define MOE_INTERMEDIATE    1024"
+c1_new = """#define NUM_EXPERTS_PER_TOK 10
+
+// TurboQuant KV-cache compression (TurboMoE)
+#define GPU_TQ_SEQ           GPU_KV_SEQ
+#define TQ_WORDS_PER_HEAD    (HEAD_DIM / 16)   // 16 for 2-bit (16 indices per uint32)
+
+#define MOE_INTERMEDIATE    1024"""
+assert c1_old in src, "CHANGE 1: anchor not found"
+src = src.replace(c1_old, c1_new, 1)
+print("✓ CHANGE 1: constants added")
+
+# ---------------------------------------------------------------------------
+# CHANGE 2: MetalCtx struct — add TurboQuant buffer declarations
+# after "id<MTLBuffer> buf_attn_gate;"
+# ---------------------------------------------------------------------------
+c2_old = """    id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM floats] full attention output
+    id<MTLBuffer> buf_attn_gate;    // [NUM_ATTN_HEADS * HEAD_DIM floats] sigmoid gate"""
+c2_new = """    id<MTLBuffer> buf_attn_out;     // [NUM_ATTN_HEADS * HEAD_DIM floats] full attention output
+    id<MTLBuffer> buf_attn_gate;    // [NUM_ATTN_HEADS * HEAD_DIM floats] sigmoid gate
+
+    // TurboQuant KV-cache compression (TurboMoE)
+    // Per token per KV head: 16*4 + 4 = 68 bytes (vs 512 fp16 = 7.5x compression)
+    id<MTLBuffer> buf_tq_k_packed[NUM_FULL_ATTN_LAYERS]; // [GPU_TQ_SEQ, NUM_KV_HEADS, TQ_WORDS_PER_HEAD] uint32
+    id<MTLBuffer> buf_tq_k_norms[NUM_FULL_ATTN_LAYERS];  // [GPU_TQ_SEQ, NUM_KV_HEADS] float32
+    id<MTLBuffer> buf_tq_v_packed[NUM_FULL_ATTN_LAYERS]; // [GPU_TQ_SEQ, NUM_KV_HEADS, TQ_WORDS_PER_HEAD] uint32
+    id<MTLBuffer> buf_tq_v_norms[NUM_FULL_ATTN_LAYERS];  // [GPU_TQ_SEQ, NUM_KV_HEADS] float32
+    id<MTLBuffer> buf_tq_rot;         // [HEAD_DIM * HEAD_DIM] float32 — orthogonal Pi
+    id<MTLBuffer> buf_tq_inv_rot;     // [HEAD_DIM * HEAD_DIM] float32 — Pi^T
+    // Encode scratch buffers
+    id<MTLBuffer> buf_tq_encode_k;        // [NUM_KV_HEADS * HEAD_DIM] fp32
+    id<MTLBuffer> buf_tq_encode_v;        // [NUM_KV_HEADS * HEAD_DIM] fp32
+    id<MTLBuffer> buf_tq_encode_k_norms;  // [NUM_KV_HEADS] fp32
+    id<MTLBuffer> buf_tq_encode_v_norms;  // [NUM_KV_HEADS] fp32
+    // TurboQuant pipelines
+    id<MTLComputePipelineState> tq_fused_attn_pipe;
+    id<MTLComputePipelineState> tq_encode_pipe;
+    id<MTLComputePipelineState> tq_pack_update_pipe;
+    id<MTLComputePipelineState> tq_dequant_pipe;
+    int use_tq_kv;  // 1 = compressed KV, 0 = float KV"""
+assert c2_old in src, "CHANGE 2: anchor not found"
+src = src.replace(c2_old, c2_new, 1)
+print("✓ CHANGE 2: struct members added")
+
+# ---------------------------------------------------------------------------
+# CHANGE 3: Pipeline creation — add TurboQuant pipelines after sigmoid_gate
+# ---------------------------------------------------------------------------
+c3_old = """    ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
+    ctx->moe_combine_residual = makePipe(@"moe_combine_residual");"""
+c3_new = """    ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
+    ctx->tq_fused_attn_pipe  = makePipe(@"tq_fused_attention");
+    ctx->tq_encode_pipe      = makePipe(@"tq_encode_packed");
+    ctx->tq_pack_update_pipe  = makePipe(@"tq_pack_update");
+    ctx->tq_dequant_pipe     = makePipe(@"tq_dequant_all");
+    if (!ctx->tq_fused_attn_pipe) {
+        fprintf(stderr, "[metal] WARNING: tq_fused_attention not available -- TurboQuant disabled\\n");
+    } else {
+        printf("[metal] TurboQuant pipelines ready\\n");
+    }
+    ctx->moe_combine_residual = makePipe(@"moe_combine_residual");"""
+assert c3_old in src, "CHANGE 3: anchor not found"
+src = src.replace(c3_old, c3_new, 1)
+print("✓ CHANGE 3: pipeline creation added")
+
+# ---------------------------------------------------------------------------
+# CHANGE 4: Buffer allocation — add TurboQuant buffers after attn_gate
+# ---------------------------------------------------------------------------
+# Find the allocation for buf_attn_gate
+c4_old = """        ctx->buf_attn_gate   = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
+                                             options:MTLResourceStorageModeShared];
+        // CMD3"""
+c4_new = """        ctx->buf_attn_gate   = [ctx->device newBufferWithLength:NUM_ATTN_HEADS * HEAD_DIM * sizeof(float)
+                                             options:MTLResourceStorageModeShared];
+
+        // TurboQuant KV-cache buffers (compressed)
+        {
+            size_t tq_packed_size = (size_t)GPU_TQ_SEQ * NUM_KV_HEADS * TQ_WORDS_PER_HEAD * sizeof(uint32_t);
+            size_t tq_norm_size   = (size_t)GPU_TQ_SEQ * NUM_KV_HEADS * sizeof(float);
+            size_t rot_size       = (size_t)HEAD_DIM * HEAD_DIM * sizeof(float);
+            size_t encode_kv_size = NUM_KV_HEADS * HEAD_DIM * sizeof(float);
+            size_t encode_norms_size = NUM_KV_HEADS * sizeof(float);
+
+            for (int i = 0; i < NUM_FULL_ATTN_LAYERS; i++) {
+                ctx->buf_tq_k_packed[i] = [ctx->device newBufferWithLength:tq_packed_size
+                                                             options:MTLResourceStorageModeShared];
+                ctx->buf_tq_k_norms[i]  = [ctx->device newBufferWithLength:tq_norm_size
+                                                            options:MTLResourceStorageModeShared];
+                ctx->buf_tq_v_packed[i] = [ctx->device newBufferWithLength:tq_packed_size
+                                                             options:MTLResourceStorageModeShared];
+                ctx->buf_tq_v_norms[i]  = [ctx->device newBufferWithLength:tq_norm_size
+                                                            options:MTLResourceStorageModeShared];
+            }
+            ctx->buf_tq_rot     = [ctx->device newBufferWithLength:rot_size options:MTLResourceStorageModeShared];
+            ctx->buf_tq_inv_rot = [ctx->device newBufferWithLength:rot_size options:MTLResourceStorageModeShared];
+            ctx->buf_tq_encode_k = [ctx->device newBufferWithLength:encode_kv_size options:MTLResourceStorageModeShared];
+            ctx->buf_tq_encode_v = [ctx->device newBufferWithLength:encode_kv_size options:MTLResourceStorageModeShared];
+            ctx->buf_tq_encode_k_norms = [ctx->device newBufferWithLength:encode_norms_size options:MTLResourceStorageModeShared];
+            ctx->buf_tq_encode_v_norms = [ctx->device newBufferWithLength:encode_norms_size options:MTLResourceStorageModeShared];
+
+            // Generate orthogonal rotation matrix Pi via QR decomposition (seeded)
+            float *Q = (float *)malloc(HEAD_DIM * HEAD_DIM * sizeof(float));
+            srand(42);
+            for (int i = 0; i < HEAD_DIM * HEAD_DIM; i++) Q[i] = (float)(rand() % 1000 - 500) / 500.0f;
+            for (int j = 0; j < HEAD_DIM; j++) {
+                for (int i = 0; i < HEAD_DIM; i++) {
+                    float dot = 0.0f;
+                    for (int k = 0; k < j; k++) dot += Q[k * HEAD_DIM + i] * Q[k * HEAD_DIM + j];
+                    Q[j * HEAD_DIM + i] -= dot * Q[j * HEAD_DIM + i];
+                }
+                float norm = 0.0f;
+                for (int k = 0; k < HEAD_DIM; k++) norm += Q[k * HEAD_DIM + j] * Q[k * HEAD_DIM + j];
+                norm = sqrtf(norm + 1e-8f);
+                for (int k = 0; k < HEAD_DIM; k++) Q[j * HEAD_DIM + k] /= norm;
+            }
+            float *rot_ptr = (float *)[ctx->buf_tq_rot contents];
+            float *inv_ptr = (float *)[ctx->buf_tq_inv_rot contents];
+            memcpy(rot_ptr, Q, HEAD_DIM * HEAD_DIM * sizeof(float));
+            // Pi^T = Pi^(-1) for orthogonal matrices
+            for (int i = 0; i < HEAD_DIM; i++)
+                for (int j = 0; j < HEAD_DIM; j++)
+                    inv_ptr[i * HEAD_DIM + j] = rot_ptr[j * HEAD_DIM + i];
+            free(Q);
+
+            printf("[metal] TurboQuant: %d layers x %.1f KB/layer KV\\n",
+                   NUM_FULL_ATTN_LAYERS, (double)(tq_packed_size * 2 + tq_norm_size * 2) / 1e3);
+
+            ctx->use_tq_kv = (getenv("TQ_KV") && atoi(getenv("TQ_KV")) == 1) ? 1 : 0;
+            if (ctx->use_tq_kv && !ctx->tq_fused_attn_pipe) {
+                fprintf(stderr, "[metal] TQ_KV=1 but TurboQuant pipelines unavailable -- falling back\\n");
+                ctx->use_tq_kv = 0;
+            }
+            if (ctx->use_tq_kv) printf("[metal] TurboQuant KV compression ENABLED\\n");
+        }
+
+        // CMD3"""
+assert c4_old in src, "CHANGE 4: anchor not found"
+src = src.replace(c4_old, c4_new, 1)
+print("✓ CHANGE 4: buffer allocation added")
+
+# ---------------------------------------------------------------------------
+# CHANGE 5: KV cache update hook — append TurboQuant encode after float KV copy
+# ---------------------------------------------------------------------------
+c5_old = """        if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+            memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
+                   k_out, kv_dim * sizeof(float));
+            memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
+                   v_out, kv_dim * sizeof(float));
+        }
+        kv->len++;
+
+        // Scaled dot-product attention (GQA)"""
+c5_new = """        if (g_metal && g_metal->attn_scores_pipe && fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS) {
+            memcpy((float *)[g_metal->buf_kv_k[fa_idx] contents] + cache_pos * kv_dim,
+                   k_out, kv_dim * sizeof(float));
+            memcpy((float *)[g_metal->buf_kv_v[fa_idx] contents] + cache_pos * kv_dim,
+                   v_out, kv_dim * sizeof(float));
+        }
+
+        // TurboQuant KV cache update — compress and append to compressed cache
+        if (g_metal && g_metal->use_tq_kv && g_metal->tq_pack_update_pipe) {
+            int tq_fa_idx = fa_idx;
+            uint32_t pos32 = (uint32_t)cache_pos;
+            uint32_t GPU_TQ_SEQ32 = GPU_TQ_SEQ;
+            float *encode_k = (float *)[g_metal->buf_tq_encode_k contents];
+            float *encode_v = (float *)[g_metal->buf_tq_encode_v contents];
+            float *encode_k_norms = (float *)[g_metal->buf_tq_encode_k_norms contents];
+            float *encode_v_norms = (float *)[g_metal->buf_tq_encode_v_norms contents];
+            memcpy(encode_k, k_out, NUM_KV_HEADS * HEAD_DIM * sizeof(float));
+            memcpy(encode_v, v_out, NUM_KV_HEADS * HEAD_DIM * sizeof(float));
+            for (int kv_h = 0; kv_h < NUM_KV_HEADS; kv_h++) {
+                float k_sq = 0.0f, v_sq = 0.0f;
+                for (int d = 0; d < HEAD_DIM; d++) {
+                    float kd = encode_k[kv_h * HEAD_DIM + d];
+                    float vd = encode_v[kv_h * HEAD_DIM + d];
+                    k_sq += kd * kd; v_sq += vd * vd;
+                }
+                encode_k_norms[kv_h] = sqrtf(k_sq + RMS_NORM_EPS);
+                encode_v_norms[kv_h] = sqrtf(v_sq + RMS_NORM_EPS);
+            }
+            id<MTLCommandBuffer> tq_cmd = [g_metal->queue commandBuffer];
+            id<MTLComputeCommandEncoder> tq_enc = [tq_cmd computeCommandEncoder];
+            [tq_enc setComputePipelineState:g_metal->tq_pack_update_pipe];
+            [tq_enc setBuffer:encode_k    offset:0 atIndex:0];
+            [tq_enc setBuffer:encode_v    offset:0 atIndex:1];
+            [tq_enc setBuffer:(float *)[g_metal->buf_tq_rot contents] offset:0 atIndex:2];
+            [tq_enc setBuffer:(uint32_t *)[g_metal->buf_tq_k_packed[tq_fa_idx] contents] offset:0 atIndex:3];
+            [tq_enc setBuffer:encode_k_norms offset:0 atIndex:4];
+            [tq_enc setBuffer:(uint32_t *)[g_metal->buf_tq_v_packed[tq_fa_idx] contents] offset:0 atIndex:5];
+            [tq_enc setBuffer:encode_v_norms offset:0 atIndex:6];
+            [tq_enc setBytes:&pos32 offset:0 atIndex:7];
+            [tq_enc setBytes:&GPU_TQ_SEQ32 offset:0 atIndex:8];
+            [tq_enc dispatchThreadgroups:MTLSizeMake(NUM_KV_HEADS * TQ_WORDS_PER_HEAD, 1, 1)
+                      threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [tq_enc endEncoding];
+            [tq_cmd commit];
+            [tq_cmd waitUntilCompleted];
+        }
+
+        kv->len++;
+
+        // Scaled dot-product attention (GQA)"""
+assert c5_old in src, "CHANGE 5: anchor not found"
+src = src.replace(c5_old, c5_new, 1)
+print("✓ CHANGE 5: KV cache update hook added")
+
+# ---------------------------------------------------------------------------
+# CHANGE 6: Attention dispatch — add TurboQuant path before the 3-dispatch path
+# Find "Enc A1: attn_scores_batched" and add TQ dispatch before it
+# ---------------------------------------------------------------------------
+c6_old = """            // Enc A1: attn_scores_batched
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->attn_scores_pipe];
+                [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
+                [enc setBytes:&hd        length:4 atIndex:3];
+                [enc setBytes:&kvd       length:4 atIndex:4];
+                [enc setBytes:&sl        length:4 atIndex:5];
+                [enc setBytes:&seq_stride length:4 atIndex:6];
+                [enc setBytes:&scale     length:4 atIndex:7];
+                [enc setBytes:&hpkv      length:4 atIndex:8];
+                [enc setBytes:&sl        length:4 atIndex:9];
+                uint32_t total_tgs = sl * NUM_ATTN_HEADS;
+                [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }"""
+c6_new = """            // TurboQuant fused attention: 1 dispatch instead of 3 (Enc A1+A2+A3)
+            if (g_metal->use_tq_kv && g_metal->tq_fused_attn_pipe) {
+                uint32_t T_kv32 = sl;
+                uint32_t causal_offset32 = 0;
+                uint32_t GPU_TQ_SEQ32 = GPU_TQ_SEQ;
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->tq_fused_attn_pipe];
+                [enc setBuffer:g_metal->buf_attn_q                                    offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_attn_gate                                 offset:0 atIndex:1];
+                [enc setBuffer:(uint32_t *)[g_metal->buf_tq_k_packed[fa_idx] contents]  offset:0 atIndex:2];
+                [enc setBuffer:(float *)[g_metal->buf_tq_k_norms[fa_idx] contents]     offset:0 atIndex:3];
+                [enc setBuffer:(uint32_t *)[g_metal->buf_tq_v_packed[fa_idx] contents] offset:0 atIndex:4];
+                [enc setBuffer:(float *)[g_metal->buf_tq_v_norms[fa_idx] contents]     offset:0 atIndex:5];
+                [enc setBuffer:(float *)[g_metal->buf_tq_rot contents]                 offset:0 atIndex:6];
+                [enc setBuffer:(float *)[g_metal->buf_tq_inv_rot contents]              offset:0 atIndex:7];
+                [enc setBuffer:g_metal->buf_attn_out                                   offset:0 atIndex:8];
+                [enc setBytes:&T_kv32          length:4 atIndex:9];
+                [enc setBytes:&GPU_TQ_SEQ32    length:4 atIndex:10];
+                [enc setBytes:&causal_offset32 length:4 atIndex:11];
+                [enc dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS * 256, 1, 1)
+                          threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            } else {
+                // Enc A1: attn_scores_batched
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                    [enc setComputePipelineState:g_metal->attn_scores_pipe];
+                    [enc setBuffer:g_metal->buf_attn_q          offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_kv_k[fa_idx]    offset:0 atIndex:1];
+                    [enc setBuffer:g_metal->buf_attn_scores     offset:0 atIndex:2];
+                    [enc setBytes:&hd        length:4 atIndex:3];
+                    [enc setBytes:&kvd       length:4 atIndex:4];
+                    [enc setBytes:&sl        length:4 atIndex:5];
+                    [enc setBytes:&seq_stride length:4 atIndex:6];
+                    [enc setBytes:&scale     length:4 atIndex:7];
+                    [enc setBytes:&hpkv      length:4 atIndex:8];
+                    [enc setBytes:&sl        length:4 atIndex:9];
+                    uint32_t total_tgs = sl * NUM_ATTN_HEADS;
+                    [enc dispatchThreadgroups:MTLSizeMake(total_tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }"""
+assert c6_old in src, "CHANGE 6: anchor not found"
+src = src.replace(c6_old, c6_new, 1)
+print("✓ CHANGE 6: TurboQuant attention dispatch added")
+
+# ---------------------------------------------------------------------------
+# CHANGE 7: Close the if-else block after attn_values — find the closing brace
+# We need to find the end of attn_values encoder and wrap A1+A2+A3 in else
+# ---------------------------------------------------------------------------
+# Find the end of attn_values_batched block and add closing brace
+c7_old = """                [enc setBytes:&hpkv      length:4 atIndex:7];
+                uint32_t total_threads = HEAD_DIM * NUM_ATTN_HEADS;
+                uint32_t tgs = (total_threads + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }"""
+c7_new = """                [enc setBytes:&hpkv      length:4 atIndex:7];
+                uint32_t total_threads = HEAD_DIM * NUM_ATTN_HEADS;
+                uint32_t tgs = (total_threads + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+                }  // end else (non-TurboQuant path)
+            }"""
+assert c7_old in src, "CHANGE 7: anchor not found"
+src = src.replace(c7_old, c7_new, 1)
+print("✓ CHANGE 7: else block closed")
+
+# ---------------------------------------------------------------------------
+# Write output
+# ---------------------------------------------------------------------------
+with open(INFER, "w") as f:
+    f.write(src)
+
+print("\nAll changes applied successfully.")
+print("Next: cat turboquant/turboquant.metal >> metal_infer/shaders.metal")

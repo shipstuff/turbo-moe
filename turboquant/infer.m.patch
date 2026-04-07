@@ -1,0 +1,48 @@
+--- a/metal_infer/infer.m
++++ b/metal_infer/infer.m
+@@ -64,6 +64,10 @@
+ #define RMS_NORM_EPS        1e-6f
+ #define NUM_EXPERTS         512
+ #define NUM_EXPERTS_PER_TOK 10
++
++// TurboQuant KV-cache compression
++#define GPU_TQ_SEQ           GPU_KV_SEQ
++#define TQ_WORDS_PER_HEAD    (HEAD_DIM / 16)   // 16 for 2-bit (16 indices per uint32)
+ #define MOE_INTERMEDIATE    1024
+ #define SHARED_INTERMEDIATE 1024
+ #define FULL_ATTN_INTERVAL  4
+@@ -76,6 +80,8 @@
+ // Full attention constants
+ #define ROPE_THETA          10000000.0f
+ #define PARTIAL_ROTARY      0.25f
++
++// TurboQuant pipelines and state — NULL if kernel not compiled
++id<MTLComputePipelineState> tq_fused_attn_pipe;
++id<MTLComputePipelineState> tq_encode_pipe;
++id<MTLComputePipelineState> tq_pack_update_pipe;
++id<MTLComputePipelineState> tq_dequant_pipe;
++
++// TurboQuant enable flag: 1 = compressed KV, 0 = float KV (default)
++int use_tq_kv;
++
++// TurboQuant KV cache buffers (compressed — replaces float KV for full-attn layers)
++// Layout per token per KV head:
++//   packed:  TQ_WORDS_PER_HEAD uint32 (2-bit indices, 16 per word)
++//   norms:   1 float32
++// Per layer per head per token: 16*4 + 4 = 68 bytes (vs 512 bytes fp16)
++id<MTLBuffer> buf_tq_k_packed[NUM_FULL_ATTN_LAYERS];
++id<MTLBuffer> buf_tq_k_norms[NUM_FULL_ATTN_LAYERS];
++id<MTLBuffer> buf_tq_v_packed[NUM_FULL_ATTN_LAYERS];
++id<MTLBuffer> buf_tq_v_norms[NUM_FULL_ATTN_LAYERS];
++
++// TurboQuant rotation matrices — generated once at startup, shared across all layers
++id<MTLBuffer> buf_tq_rot;        // [HEAD_DIM * HEAD_DIM] float32 — orthogonal Pi
++id<MTLBuffer> buf_tq_inv_rot;    // [HEAD_DIM * HEAD_DIM] float32 — Pi^T
++
++// TurboQuant encode buffers (scratch for prefill / cache update)
++id<MTLBuffer> buf_tq_encode_k;    // [NUM_KV_HEADS * HEAD_DIM] fp32 scratch for K
++id<MTLBuffer> buf_tq_encode_v;    // [NUM_KV_HEADS * HEAD_DIM] fp32 scratch for V
++id<MTLBuffer> buf_tq_encode_k_norms; // [NUM_KV_HEADS] fp32 K norms
++id<MTLBuffer> buf_tq_encode_v_norms; // [NUM_KV_HEADS] fp32 V norms
++id<MTLBuffer> buf_tq_encode_k_packed; // [NUM_KV_HEADS * TQ_WORDS_PER_HEAD] uint32
++id<MTLBuffer> buf_tq_encode_v_packed; // [NUM_KV_HEADS * TQ_WORDS_PER_HEAD] uint32
