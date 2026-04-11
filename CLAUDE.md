@@ -39,16 +39,29 @@ turbomoe/
 **Qwen3.5-397B-A17B** — 397B parameter MoE, 60 layers, 512 experts, K=4 active + 1 shared expert.
 - **4-bit experts** (209GB on disk): 4.36 tok/s on M3 Max, tool calling OK — production config
 - **2-bit experts** (120GB on disk): 5.74 tok/s, breaks JSON/tool calling output
-- **Current mini (M4 Pro) results (2026-04-11 morning session, TurboQuant fixed!):**
+- **Current mini (M4 Pro) results (2026-04-11, TurboQuant fixed + sgemm Q rotation):**
+
+Short context (16-token prompt):
 
 | Config | Tokens | tok/s | Quality | Notes |
 |--------|--------|-------|---------|-------|
 | Baseline (no cache) | 128 | 5.91 | ✅ Good | OS page cache; 104-token coherent story |
-| **TQ_KV=1 (fixed)** | 128 | 5.31 | ✅ Good | KV cache 33.4 MB (7.5x compression) |
-| **TQ_KV=1 (fixed)** | 256 | 5.15 | ✅ Good | 256 coherent tokens, no drift |
+| **TQ_KV=1** | 128 | 5.65 | ✅ Good | KV cache 33.4 MB (7.5x compression) |
+| **TQ_KV=1** | 256 | 5.15 | ✅ Good | 256 coherent tokens, no drift |
 | malloc-cache-64 | 128 | 6.13 | ✅ Good | 0% hit (thrashing — 64 slots vs 240 active/tok) |
 | malloc-cache-512 | 96 | 6.07 | ✅ Good | 32.2% hit rate (8569/26640) |
 | `--predict` | 128 | 2.51 | ✅ Good | 26% hit rate, -58% speed net regression |
+
+Long context — TQ pulls ahead because it keeps `cmd2_wait` flat (constant
+KV cache size) while the baseline scales linearly:
+
+| Context | Baseline tok/s | TQ_KV=1 tok/s | TQ delta |
+|---|---|---|---|
+| ~30 tok | 5.91 | 5.65 | -4.4% |
+| ~1k tok | 4.98 | 5.40 | **+8.4%** |
+| ~2.4k tok | 3.98 | 4.69 | **+17.8%** |
+
+Crossover (TQ overhead = TQ savings) sits at **~600–800 token context**.
 
 **⚠️ The older "5.86 / 5.99 / 14.72 / 14.80 tok/s" numbers that used to live in
 this section were bogus** — two independent bugs were corrupting inference:
