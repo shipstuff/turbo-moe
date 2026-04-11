@@ -179,7 +179,25 @@ TQ_KV=1 ./infer --prompt "Explain quantum computing" --tokens 100 -T
 
 1. **expert_io optimization**: Can a small persistent "expert working set" stay hot in GPU memory across
    layer transitions without being evicted by memory pressure?
+   *Partially answered 2026-04-11: naive `--pin-top-N` cross-prompt generalization is ~42% of optimal.
+   See `flash_moe/scripts/analyze_routing.py` and task write-up.*
 3. **Mixed-bit experts**: Some experts may be more quantization-sensitive than others. Per-expert
    bit-width optimization could preserve quality while reducing memory bandwidth.
 4. **Attention kernel register tiling**: Apple Silicon GPU has fixed shared memory. Better tiling
    could reduce cmd1_wait (currently 33.8% of layer time).
+5. **Reduced-precision attention inner loops**: cmd1_wait is 51 ms/token (0.858 ms × 60 layers).
+   Converting the inner matmul accumulator to bf16/fp16 while keeping fp32 output could cut 20-40%.
+   Directly attacks the GPU-saturation ceiling the batch prefill investigation ran into.
+6. **ANE offload (linear attention layers)**: Apple Neural Engine (16 compute cores) is 0% utilized.
+   The `anemll-qwen35` project at `carl@192.168.0.62:~/projects/anemll-qwen35/` already has a working
+   PyTorch→ANE port of Qwen3.5-9B dense (same GatedDeltaNet + Qwen3NextAttention layers flash_moe uses).
+   Full scoping in `flash_moe/docs/2026-04-11-ane-offload-scoping.md`. Gated on measuring Swift CoreML
+   per-prediction dispatch overhead in Phase 0 before committing the port.
+
+## Batch prefill (cold-cache only — 2026-04-11)
+
+`--batch-prefill T` is opt-in and cold-cache-only. Warm-cache real prompts regress at long context
+(+57% at 138 tok) because per-layer batching breaks the intra-token CMD3↔CMD1 pipelining. See
+`flash_moe/docs/2026-04-11-batch-prefill-scoping.md` afternoon update for the full loop-inversion
+trace and the two refactor approaches investigated (multi-buffered deferred state, MoE cross-token
+decoupling). Both concluded the warm-cache ceiling is GPU-saturation-bound at ~150 ms/token.
