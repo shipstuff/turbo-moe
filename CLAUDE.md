@@ -39,12 +39,13 @@ turbomoe/
 **Qwen3.5-397B-A17B** — 397B parameter MoE, 60 layers, 512 experts, K=4 active + 1 shared expert.
 - **4-bit experts** (209GB on disk): 4.36 tok/s on M3 Max, tool calling OK — production config
 - **2-bit experts** (120GB on disk): 5.74 tok/s, breaks JSON/tool calling output
-- **Current mini (M4 Pro) results (2026-04-10 overnight session, post-repack + lz4 fix):**
+- **Current mini (M4 Pro) results (2026-04-11 morning session, TurboQuant fixed!):**
 
 | Config | Tokens | tok/s | Quality | Notes |
 |--------|--------|-------|---------|-------|
-| Baseline (no cache) | 128 | 6.01 | ✅ Good | OS page cache; 104-token coherent story |
-| TQ_KV=1 (fallback) | 128 | 6.61 | ✅ Good | Forces float KV — TQ shader still broken |
+| Baseline (no cache) | 128 | 5.91 | ✅ Good | OS page cache; 104-token coherent story |
+| **TQ_KV=1 (fixed)** | 128 | 5.31 | ✅ Good | KV cache 33.4 MB (7.5x compression) |
+| **TQ_KV=1 (fixed)** | 256 | 5.15 | ✅ Good | 256 coherent tokens, no drift |
 | malloc-cache-64 | 128 | 6.13 | ✅ Good | 0% hit (thrashing — 64 slots vs 240 active/tok) |
 | malloc-cache-512 | 96 | 6.07 | ✅ Good | 32.2% hit rate (8569/26640) |
 | `--predict` | 128 | 2.51 | ✅ Good | 26% hit rate, -58% speed net regression |
@@ -61,13 +62,29 @@ returned -1, and the malloc cache populated with zero-filled buffers. See
 `flash_moe/benchmarks/2026-04-10-post-repack-e2e.md` for the full forensic
 write-up.
 
-**TurboQuant is currently force-disabled** (falls back to float KV with a
-warning). 4 separate shader bugs were identified and fixed (Gram-Schmidt,
-Phase 3/4 in `tq_fused_attention`, quantization scale), but a 5th issue
-remains: TQ_KV=1 with the opt-in `TQ_KV_FORCE=1` still corrupts the CPU KV
-cache path (output diverges at kv_len < 32), suggesting a memory-bounds or
-Metal aliasing bug. Needs focused debugging. See
-`flash_moe/benchmarks/2026-04-10-post-repack-e2e.md`.
+**TurboQuant fixed end-to-end on 2026-04-11.** Eight separate bugs needed
+to be fixed before TQ produced coherent output:
+1. `tq_pack_update` was binding the per-step CPU scratch buffers to the
+   kernel's `k_norms_out`/`v_norms_out` slots instead of the persistent
+   per-position cache that `tq_fused_attention` reads. Norms cache stayed
+   all zeros forever — the *primary* bug.
+2. Gram-Schmidt rotation matrix was not orthonormal (mixed row/col indices).
+3. `tq_fused_attention` Phase 3 didn't broadcast `global_max`/`global_sum`
+   across the threadgroup.
+4. Phase 4 inverse rotation was a scalar × column-sum, not a matmul.
+5. 2-bit centroids `{-1.5,-0.5,0.5,1.5}` assume unit-variance inputs but
+   `(Pi·k)/||k||` has per-dim std `1/sqrt(HEAD_DIM)`. Needed `sqrt(256)=16`
+   scale at encode/decode.
+6. Sigmoid gate was applied twice (once in shader Phase 5, once in
+   `cmd_fused`'s `sigmoid_gate` kernel).
+7. `tq_pack_update`'s `kv_head=1` norm write was guarded by `tgid==0` which
+   only fires for `kv_head=0`.
+8. Q was passed to `tq_fused_attention` unrotated, breaking
+   `dot(Pi·Q, Pi·K) = dot(Q, K)`. Need to pre-rotate Q on CPU before the
+   kernel sees `buf_attn_q`.
+
+See `flash_moe/benchmarks/2026-04-10-post-repack-e2e.md` for the full
+debugging log and how each bug was found.
 
 ## Quantization Formats
 
@@ -75,7 +92,7 @@ Metal aliasing bug. Needs focused debugging. See
 |--------|------|---------|--------------|-------|
 | 4-bit experts | 209GB | Excellent | Yes | Current best |
 | 2-bit experts | 120GB | Good* | No (breaks JSON) | Faster but unreliable |
-| TQ KV-cache | — | ❌ Broken | — | Multiple shader bugs, force-disabled; `TQ_KV=1` safe-falls-back |
+| TQ KV-cache | — | ✅ Working | ✅ | 7.5x KV cache compression, ~12% gen slowdown at 128 tok |
 
 ## Performance Profile (M4 Pro, baseline no-cache, 128 tokens)
 
