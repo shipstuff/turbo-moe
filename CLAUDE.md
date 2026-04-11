@@ -60,8 +60,12 @@ KV cache size) while the baseline scales linearly:
 | ~30 tok | 5.91 | 5.65 | -4.4% |
 | ~1k tok | 4.98 | 5.40 | **+8.4%** |
 | ~2.4k tok | 3.98 | 4.69 | **+17.8%** |
+| ~3k tok | 3.72 | 4.27 | **+14.8%** |
 
 Crossover (TQ overhead = TQ savings) sits at **~600–800 token context**.
+At 3k the speedup dips slightly because the 251 MB float KV cache starts
+adding page-cache pressure (expert_io grows in baseline); TQ's 33.4 MB
+cache stays out of the way.
 
 **⚠️ The older "5.86 / 5.99 / 14.72 / 14.80 tok/s" numbers that used to live in
 this section were bogus** — two independent bugs were corrupting inference:
