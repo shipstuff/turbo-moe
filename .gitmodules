@@ -1,0 +1,3 @@
+[submodule "flash_moe"]
+	path = flash_moe
+	url = https://github.com/shipstuff/flash-moe.git

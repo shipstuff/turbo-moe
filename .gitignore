@@ -17,6 +17,7 @@ packed_experts/
 # Mac
 .DS_Store
 *.swp
+.codex
 
 # Python
 __pycache__/
