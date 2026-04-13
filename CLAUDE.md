@@ -23,8 +23,8 @@ On dense models, TurboQuant alone gives about 5.6x KV-cache compression on K/V. 
 
 Early development, but the core TurboQuant path is working end-to-end and integrated into the Flash-MoE inference engine.
 
-**Primary test machine:** Mac mini M4 (`carl@192.168.0.61`)
-**Development workflow:** Develop on WSL, push to the mini over SSH, test there.
+**Primary test machine:** Apple Silicon Mac mini M4
+**Development workflow:** Develop locally, validate on Apple Silicon hardware, push to GitHub.
 
 This file is the canonical project document. `AGENTS.md` and `README.md` point here.
 
@@ -60,8 +60,7 @@ turbomoe/
 │   └── ...
 ├── turboquant/            ← TurboQuant source (ported to Metal/C)
 │   ├── turboquant.metal
-│   ├── INTEGRATION.md
-│   └── infer.m.patch
+│   └── INTEGRATION.md
 └── scripts/
     ├── prepare_model.sh
     └── benchmark.sh
@@ -222,7 +221,7 @@ TQ_KV=1 ./infer --prompt "Explain quantum computing" --tokens 100 -T
    Converting the inner matmul accumulator to bf16/fp16 while keeping fp32 output could cut 20-40%.
    Directly attacks the GPU-saturation ceiling the batch prefill investigation ran into.
 6. **ANE offload (linear attention layers)**: Apple Neural Engine (16 compute cores) is 0% utilized.
-   The `anemll-qwen35` project at `carl@192.168.0.62:~/projects/anemll-qwen35/` already has a working
+   A separate `anemll-qwen35` project already has a working
    PyTorch→ANE port of Qwen3.5-9B dense (same GatedDeltaNet + Qwen3NextAttention layers flash_moe uses).
    Full scoping in `flash_moe/docs/2026-04-11-ane-offload-scoping.md`. Gated on measuring Swift CoreML
    per-prediction dispatch overhead in Phase 0 before committing the port.
