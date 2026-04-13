@@ -8,8 +8,8 @@ TurboMoE combines two orthogonal techniques for maximum inference efficiency on 
 
 | Technique | Source | What it does |
 |---|---|---|
-| **TurboQuant** | Google/MLX | Random rotation + Lloyd-Max 2-bit MSE quantization + QJL residual for KV-cache compression |
-| **Flash-MoE** | danveloper/github.com/danveloper/flash-moe | Pure C/Metal inference with FMA-optimized 4-bit dequant kernels + SSD expert streaming for MoE models |
+| **TurboQuant** | [Google/MLX](https://research.google/blog/turboquant-redefining-ai-efficiency-with-extreme-compression/) | Random rotation + Lloyd-Max 2-bit MSE quantization + QJL residual for KV-cache compression |
+| **Flash-MoE** | [danveloper/github.com/danveloper/flash-moe](https://github.com/danveloper/flash-moe) | Pure C/Metal inference with FMA-optimized 4-bit dequant kernels + SSD expert streaming for MoE models |
 
 The goal is to run MoE models with both compressed weights and compressed KV-cache on Apple Silicon.
 
