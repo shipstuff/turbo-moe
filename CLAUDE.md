@@ -71,33 +71,40 @@ turbomoe/
 **Qwen3.5-397B-A17B** — 397B parameter MoE, 60 layers, 512 experts, K=4 active + 1 shared expert.
 - **4-bit experts** (209GB on disk): 4.36 tok/s on M3 Max, tool calling OK — production config
 - **2-bit experts** (120GB on disk): 5.74 tok/s, breaks JSON/tool calling output
-- **Current mini (M4 Pro) results (2026-04-11, TurboQuant fixed + sgemm Q rotation):**
+- **Current mini (M4 Pro) results (2026-04-12, all optimizations applied):**
 
-Short context (16-token prompt):
+Short context (1-token prompt, 64 gen tokens, warm page cache):
 
-| Config | Tokens | tok/s | Quality | Notes |
-|--------|--------|-------|---------|-------|
-| Baseline (no cache) | 128 | 5.91 | ✅ Good | OS page cache; 104-token coherent story |
-| **TQ_KV=1** | 128 | 5.65 | ✅ Good | KV cache 33.4 MB (7.5x compression) |
-| **TQ_KV=1** | 256 | 5.15 | ✅ Good | 256 coherent tokens, no drift |
-| malloc-cache-64 | 128 | 6.13 | ✅ Good | 0% hit (thrashing — 64 slots vs 240 active/tok) |
-| malloc-cache-512 | 96 | 6.07 | ✅ Good | 32.2% hit rate (8569/26640) |
-| `--predict` | 128 | 2.51 | ✅ Good | 26% hit rate, -58% speed net regression |
+| Config | tok/s (best) | tok/s (typical) | cmd1_wait | cmd2_wait | expert_io | total_layer |
+|--------|-------------|-----------------|-----------|-----------|-----------|-------------|
+| Baseline | 8.68 | 8.5-8.7 | 1.056ms | 0.061ms | 0.656ms | 1.850ms |
+| **TQ_KV=1** | **8.80** | 8.7-8.8 | 1.018ms | 0.072ms | 0.656ms | 1.825ms |
+| Cold (1st run) | 5.4 | — | 1.304ms | 0.063ms | 1.545ms | 2.990ms |
 
-Long context — TQ pulls ahead because it keeps `cmd2_wait` flat (constant
-KV cache size) while the baseline scales linearly:
+Long context (258-token prompt, 2048 gen tokens):
 
-| Context | Baseline tok/s | TQ_KV=1 tok/s | TQ delta |
-|---|---|---|---|
-| ~30 tok | 5.91 | 5.65 | -4.4% |
-| ~1k tok | 4.98 | 5.40 | **+8.4%** |
-| ~2.4k tok | 3.98 | 4.69 | **+17.8%** |
-| ~3k tok | 3.72 | 4.27 | **+14.8%** |
+| Context | Baseline tok/s | TQ_KV=1 tok/s | cmd1_wait | expert_io |
+|---|---|---|---|---|
+| ~260 tok | 4.95 | 5.27 | 1.574ms | 1.634ms |
+| ~500 tok | 5.69 | — | — | — |
+| ~1k tok | 5.58 | — | — | — |
+| ~2k tok | 4.77 | — | — | — |
+| ~2.7k tok | 4.67 | — | 1.826ms | 1.590ms |
 
-Crossover (TQ overhead = TQ savings) sits at **~600–800 token context**.
-At 3k the speedup dips slightly because the 251 MB float KV cache starts
-adding page-cache pressure (expert_io grows in baseline); TQ's 33.4 MB
-cache stays out of the way.
+TQ at 258-tok prompt: +6.5% gen speed, -14% TTFT, -10% cmd1_wait.
+TQ advantage compounds at longer context (7.5× KV compression: 33.4 MB vs 251 MB).
+At short warm context, TQ is now slightly FASTER than baseline due to CMD1 fusion
+eliminating the TQ dispatch overhead.
+
+**Optimization history (2026-04-12 session):**
+- Pre-optimization baseline: 5.91 tok/s (128 tok) / 8.35 tok/s (64 tok warm)
+- +CMD1+CMD2 fusion (linear + full-attn layers): +4.7%
+- +Fused flash-attention with fp16 KV cache: +1-2%
+- +Compute encoder consolidation: +0.5%
+- +TQ CMD1 fusion: cmd2_wait 0.42→0.06ms (86% reduction)
+- +Block-tiled flash-attention: bandwidth savings at long context
+- **Combined: 8.35 → 8.7 tok/s (+4-7% at short context)**
+- At 200k context: fused tiled attention + fp16 KV halves bandwidth vs float32
 
 **⚠️ The older "5.86 / 5.99 / 14.72 / 14.80 tok/s" numbers that used to live in
 this section were bogus** — two independent bugs were corrupting inference:
@@ -141,31 +148,54 @@ debugging log and how each bug was found.
 |--------|------|---------|--------------|-------|
 | 4-bit experts | 209GB | Excellent | Yes | Current best |
 | 2-bit experts | 120GB | Good* | No (breaks JSON) | Faster but unreliable |
-| TQ KV-cache | — | ✅ Working | ✅ | 7.5x KV cache compression, ~12% gen slowdown at 128 tok |
+| TQ KV-cache | — | ✅ Working | ✅ | 7.5x KV cache compression. Now FASTER than baseline at short ctx (8.80 vs 8.68) due to CMD1 fusion. +6.5% at medium ctx. |
+| FP16 KV-cache | — | ✅ Working | ✅ | 2x KV bandwidth reduction for non-TQ path. Fused flash-attention with online softmax. |
 
-## Performance Profile (M4 Pro, baseline no-cache, 128 tokens)
+## Performance Profile (M4 Pro, warm cache, 64 tokens, 2026-04-12)
 
-Per-layer breakdown:
+Per-layer breakdown (after all CMD1+CMD2 fusion + encoder consolidation):
 ```
-expert_io:      1.337ms  (49.5%) — loading expert weights from SSD via OS page cache
-cmd1_wait:      0.858ms  (31.8%) — GPU attention kernel
-cmd2_wait:      0.426ms  (15.8%) — residual/normalization kernel
-tq_kernel_time: 0.000ms  ( 0.0%) — TurboQuant disabled
-total_layer:    2.703ms
+expert_io:      0.656ms  (35.5%) — loading expert weights from SSD via OS page cache
+cmd1_wait:      1.056ms  (57.1%) — GPU projections + fused attention + routing
+cmd2_wait:      0.061ms  ( 3.3%) — nearly eliminated by CMD1+CMD2 fusion
+tq_kernel_time: 0.000ms  ( 0.0%) — TQ fused into CMD1
+total_layer:    1.850ms
 ```
 
-**Research targets for further optimization:**
-1. **expert_io** (49.5%) — persistent expert working set in GPU memory, expert clustering by co-activation patterns, mixed-bit compression per expert based on sensitivity analysis
-2. **cmd1_wait** (31.8%) — reduced-precision attention inner loops (fp16/bf16 vs fp32), IO-aware attention kernel tiling for Apple Silicon GPU shared memory
-3. **Actually-working TurboQuant** — once the CPU-cache-corruption bug is root-caused, the 4 shader-level fixes already in place should bring TQ to approximate correctness
+**Key: cmd2_wait was reduced from 0.426ms to 0.061ms** by fusing all CMD2 work
+(o_proj, residual, norm, routing) into CMD1 for both linear and full-attention layers.
+cmd1_wait is now the dominant GPU cost and scales with context length (attention).
+
+**Remaining optimization targets:**
+1. **Fused flash-attention tuning** — at 200k context, attention is 93% of cmd1_wait.
+   Block-tiled kernel written (activates at seq_len ≥ 512) but needs perf tuning
+   for longer contexts. Reference: FlashAttention-2 tiling approach.
+2. **expert_io** (35.5%) — persistent expert hot-set in GPU memory. Cross-prompt
+   generalization ~42%. Expert I/O overlap is architecturally impossible (routing
+   depends on full attention chain — investigated and confirmed 2026-04-12).
+3. **Prefill speed** — sequential prefill at ~193ms/token is the wall for long
+   prompts (2.7k tokens = 8.9 min). Hybrid batch/serial switchover would help.
 
 ## What We Tried (Highlights)
 
 ### Kept
+- **CMD1+CMD2 fusion** (2026-04-12): Encodes all CMD2 work (o_proj, residual, norm, routing)
+  into CMD1 for both linear and full-attention layers. cmd2_wait 0.426→0.061ms (86% reduction).
+  GPU RoPE kernel `fullattn_norm_rope_kv` for full-attn layers. Combined +4.7%.
+- **Fused flash-attention with fp16 KV cache** (2026-04-12): Single kernel replaces
+  scores+softmax+values+sigmoid_gate using online softmax. KV cache 33.6→16.8 MB/layer.
+  Eliminates 25MB intermediate scores buffer at 200k context.
+- **Block-tiled flash-attention** (2026-04-12): `fused_flash_attention_fp16_tiled` loads
+  KV blocks into threadgroup shared memory. 8× bandwidth reduction at long context.
+  Context-adaptive: tiled at seq_len >= 512, untiled below.
+- **TQ CMD1 fusion** (2026-04-12): GPU Q rotation kernel + tq_pack_update + tq_fused_attention
+  all encoded into CMD1. TQ now matches or exceeds baseline speed at short context.
+- **Compute encoder consolidation** (2026-04-12): Share Metal compute encoders across batch
+  matvec dispatches and sequential dependent kernels. cmd1_submit 0.038→0.025ms (-34%).
+- **Malloc cache release after prefill** (2026-04-12): Free 18GB cache before generation
+  so OS page cache reclaims memory. 3× cold TTFT + generation recovery.
 - **`repack_experts_v2.py`** (2026-04-10): rebuilds `packed_experts/layer_XX.bin` using the safetensors library's own header offsets instead of the hand-maintained `expert_index.json`, which had `data_offsets[0]` stored as raw (without the `8+hdr_len` adjustment). This is the ONLY way to correctly rebuild packed experts.
 - **lz4_comp_buf stack-init fix** (2026-04-10): `memset(tasks, 0, sizeof(tasks))` at every `InferPreadTask tasks[MAX_K]` declaration — eliminates the silent malloc-cache pread failure and its bogus "+87% speedup" phantom benchmark.
-- TQ latency histogram instrumentation (-T flag): zero stalls detected, p99.99=0.424ms — TQ dispatch path is stall-free (even if it produces wrong answers)
-- MODEL_PATH_DEFAULT fixed to /Users/carl/models/Qwen3.5-397B-A17B-4bit
 - FMA-optimized dequant kernel: +12% from rearrange `(nibble*scale+bias)*x` → `fma(nibble, scale*x, bias*x)`
 - "Trust the OS" page cache: OS manages expert caching better than any custom cache
 
@@ -184,6 +214,9 @@ total_layer:    2.703ms
 - **Speculative early routing**: -38% — cache pollution + overhead
 - **dispatch_io**: -70% — dispatch_data management overhead
 - **MTP speculative decoding**: break-even — MoE I/O scales per-token unlike dense models
+- **CMD3+CMD1 command buffer merge**: -5% — GPU gets 0.32ms free overlap during CPU inter-layer work from early CMD3 commit; delaying commit loses more overlap than the 0.15ms commit savings
+- **Expert I/O overlap (MTLSharedEvent)**: impossible — routing is last in CMD1, no GPU work after it to overlap with. Investigated and confirmed 2026-04-12
+- **ANE layer offload**: -43% — serial dependency (ANE attention → GPU experts → ANE attention) kills pipeline. Reconfirmed with mini-02 measurements 2026-04-12
 
 ## Tech Stack
 
@@ -209,22 +242,33 @@ TQ_KV=1 ./infer --prompt "Explain quantum computing" --tokens 100 -T
 
 ## Open Research Questions
 
-1. **expert_io optimization**: Can a small persistent "expert working set" stay hot in GPU memory across
-   layer transitions without being evicted by memory pressure?
-   *Partially answered 2026-04-11: naive `--pin-top-N` cross-prompt generalization is ~42% of optimal.
-   See `flash_moe/scripts/analyze_routing.py` and task write-up.*
-3. **Mixed-bit experts**: Some experts may be more quantization-sensitive than others. Per-expert
-   bit-width optimization could preserve quality while reducing memory bandwidth.
-4. **Attention kernel register tiling**: Apple Silicon GPU has fixed shared memory. Better tiling
-   could reduce cmd1_wait (currently 33.8% of layer time).
-5. **Reduced-precision attention inner loops**: cmd1_wait is 51 ms/token (0.858 ms × 60 layers).
-   Converting the inner matmul accumulator to bf16/fp16 while keeping fp32 output could cut 20-40%.
-   Directly attacks the GPU-saturation ceiling the batch prefill investigation ran into.
-6. **ANE offload (linear attention layers)**: Apple Neural Engine (16 compute cores) is 0% utilized.
-   A separate `anemll-qwen35` project already has a working
-   PyTorch→ANE port of Qwen3.5-9B dense (same GatedDeltaNet + Qwen3NextAttention layers flash_moe uses).
-   Full scoping in `flash_moe/docs/2026-04-11-ane-offload-scoping.md`. Gated on measuring Swift CoreML
-   per-prediction dispatch overhead in Phase 0 before committing the port.
+1. **Fused flash-attention tuning**: Block-tiled kernel written (`fused_flash_attention_fp16_tiled`)
+   but needs perf tuning for 200k context. Currently activates at seq_len >= 512. At 200k, KV cache
+   is 200MB/layer — tiling gives 8× bandwidth reduction by sharing K/V blocks across simdgroups.
+   *Status: kernel functional, correctness verified, context-adaptive dispatch in place.*
+2. **Persistent expert hot-set**: Pin top-N frequent experts in GPU memory. Cross-prompt overlap ~42%.
+   Expected 10-15% expert_io reduction. Routing analysis data exists.
+   *Status: scoped, not implemented.*
+3. **Prefill speed**: Sequential at ~193ms/token. Batch prefill (T=4) gives 10× cold-cache speedup
+   but +57% warm-cache regression. Hybrid batch/serial switchover would give best of both.
+   *Status: batch prefill shipped, hybrid switchover not implemented.*
+4. **ANE parallel helper model**: Run 0.8B model on ANE alongside flash_moe on GPU. Proven on
+   mini-02: 45 tok/s ANE, 10% GPU overhead. Product-level improvement, not tok/s.
+   *Status: validated architecture, not integrated.*
+
+## Closed Research Questions (2026-04-12)
+
+- **Expert I/O overlap**: Architecturally impossible. Routing depends on full attention chain.
+  MTLSharedEvent investigated — no GPU work after routing to overlap with. Confirmed.
+- **ANE layer offload**: 43% wall-clock regression from serial dependency (ANE attention →
+  GPU experts → ANE attention). Reconfirmed with mini-02 data. Blocked permanently for MoE.
+- **CMD3+CMD1 merge**: GPU overlap (0.32ms) > commit savings (0.15ms). Deferred pipeline's
+  early CMD3 commit is a feature. Attempted and reverted.
+- **Attention kernel bf16**: At short context, attention is only 0.5% of compute (projections
+  dominate). Apple Silicon accelerates fp16 not bf16. KV cache already uses fp16.
+- **Speculative early routing**: -38% from cache pollution. Re-evaluated for ANE: 6.6ms
+  dispatch overhead >> 1ms overlap target.
+- **cmd2_wait reduction**: Already at 0.061ms (was 0.426ms). Tapped out.
 
 ## Batch prefill (cold-cache only — 2026-04-11)
 
