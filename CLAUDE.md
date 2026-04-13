@@ -1,15 +1,48 @@
 # TurboMoE — Combining TurboQuant KV-Cache Compression with Flash-MoE
 
-## Project Overview
+**Combining KV-cache compression (TurboQuant) with 4-bit MoE inference (Flash-MoE) on Apple Silicon.**
 
-Combines two orthogonal techniques:
-- **TurboQuant** (Google/MLX): Random rotation + Lloyd-Max 2-bit MSE quantization + QJL residual for KV-cache compression (5.6x on K/V)
-- **Flash-MoE** (danveloper/github.com/danveloper/flash-moe): Pure C/Metal inference with FMA-optimized 4-bit dequant kernels + SSD expert streaming for MoE models
+## What
 
-The goal is to run MoE models with both compressed weights AND compressed KV-cache on Apple Silicon.
+TurboMoE combines two orthogonal techniques for maximum inference efficiency on Apple Silicon Macs:
 
-**Primary test machine:** Mac mini M4 (carl@192.168.0.61)
-**Development workflow:** Develop on WSL, push to mini over SSH, test there.
+| Technique | Source | What it does |
+|---|---|---|
+| **TurboQuant** | Google/MLX | Random rotation + Lloyd-Max 2-bit MSE quantization + QJL residual for KV-cache compression |
+| **Flash-MoE** | danveloper/github.com/danveloper/flash-moe | Pure C/Metal inference with FMA-optimized 4-bit dequant kernels + SSD expert streaming for MoE models |
+
+The goal is to run MoE models with both compressed weights and compressed KV-cache on Apple Silicon.
+
+## Why
+
+MoE models like Qwen3.5-397B have massive weight footprints that must be streamed from SSD. Compressing the KV-cache frees unified memory bandwidth and OS page cache for expert streaming, which dominates MoE inference time.
+
+On dense models, TurboQuant alone gives about 5.6x KV-cache compression on K/V. In this repo the two techniques stack: compress the KV-cache and the model weights.
+
+## Status
+
+Early development, but the core TurboQuant path is working end-to-end and integrated into the Flash-MoE inference engine.
+
+**Primary test machine:** Mac mini M4 (`carl@192.168.0.61`)
+**Development workflow:** Develop on WSL, push to the mini over SSH, test there.
+
+This file is the canonical project document. `AGENTS.md` and `README.md` point here.
+
+## Quick Start
+
+```bash
+git clone git@github.com:shipstuff/turbo-moe.git
+cd turbo-moe
+git submodule update --init --recursive
+cd flash_moe/metal_infer
+make
+
+# Run inference
+./infer --prompt "Hello world" --tokens 50
+
+# With TurboQuant KV-cache enabled
+TQ_KV=1 ./infer --prompt "Hello world" --tokens 50 -T
+```
 
 ## Repository Structure
 
